@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+
+# Environment
+.env
+
+# FFmpeg binary (user-supplied, not committed)
+bin/ffmpeg.exe
+
+# Uploads / temp files
+tmp/
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Generated transcription output
+output/
+
+# Test/sample video files
+*.mp4
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# IDE
+.vscode/
+.idea/
