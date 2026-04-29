@@ -1,52 +1,62 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
+
+from escucha.audio import extract_audio, AudioExtractionError
 from escucha.config import Settings
+from escucha.diarizer import load_diarization_pipeline, diarize, DiarizationError
+from escucha.jobs import Job, JobRegistry, PipelineStep
+from escucha.merger import merge_transcript_and_diarization
+from escucha.models import RawSegment, DiarizedSegment
+from escucha.summarizer import summarize_with_ollama, summarize_with_claude, SummarizationError
+from escucha.transcriber import load_whisper_model, transcribe, TranscriptionError
 
 logger = logging.getLogger("escucha")
-from escucha.audio import extract_audio, AudioExtractionError
-from escucha.transcriber import load_whisper_model, transcribe, TranscriptionError
-from escucha.diarizer import load_diarization_pipeline, diarize, DiarizationError
-from escucha.merger import merge_transcript_and_diarization
-from escucha.summarizer import (
-    summarize_with_ollama,
-    summarize_with_claude,
-    SummarizationError,
-)
-from escucha.jobs import Job, JobRegistry, PipelineStep
-from escucha.models import RawSegment, DiarizedSegment
 
 
-def _save_outputs(job_id: str, diarized: list, summary: str, base_dir: Path) -> None:
-    """Write transcript and summary files to output/ after a completed job."""
-    out_dir = base_dir / "output"
-    out_dir.mkdir(exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{stamp}_{job_id}"
-
-    # Transcript: one line per segment
-    transcript_lines = [f"[{_fmt(s.start)}] {s.speaker}: {s.text}" for s in diarized]
-    transcript_text = "\n".join(transcript_lines)
-    (out_dir / f"{stem}_transcript.txt").write_text(transcript_text, encoding="utf-8")
-
-    # Summary
-    if summary:
-        (out_dir / f"{stem}_summary.txt").write_text(summary, encoding="utf-8")
-
-    logger.info("Saved output files to output/%s_*.txt", stem)
-
-
-def _fmt(seconds: float) -> str:
+def _format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _save_outputs(
+    job_id: str,
+    diarized: list[DiarizedSegment],
+    summary: str,
+    base_dir: Path,
+) -> tuple[Path, Path | None]:
+    """Write transcript and (if present) summary files to ``output/``.
+
+    Returns the paths of the files written. Raises on any IO error so the
+    caller can decide whether to fail the job or just log.
+    """
+    out_dir = base_dir / "output"
+    out_dir.mkdir(exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"{stamp}_{job_id}"
+
+    transcript_path = out_dir / f"{stem}_transcript.txt"
+    transcript_lines = [
+        f"[{_format_timestamp(seg.start)}] {seg.speaker}: {seg.text}"
+        for seg in diarized
+    ]
+    transcript_path.write_text("\n".join(transcript_lines), encoding="utf-8")
+
+    summary_path: Path | None = None
+    if summary:
+        summary_path = out_dir / f"{stem}_summary.txt"
+        summary_path.write_text(summary, encoding="utf-8")
+
+    return transcript_path, summary_path
+
+
 class PipelineRunner:
-    """Stateful pipeline runner. Holds loaded models across jobs to avoid reloading."""
+    """Stateful runner that holds loaded models across jobs to avoid reloading."""
 
     def __init__(self, settings: Settings, registry: JobRegistry) -> None:
         self._settings = settings
@@ -54,104 +64,151 @@ class PipelineRunner:
         self._whisper_model = None
         self._diarization_pipeline = None
 
+    @property
+    def whisper_ready(self) -> bool:
+        return self._whisper_model is not None
+
+    @property
+    def diarization_ready(self) -> bool:
+        return self._diarization_pipeline is not None
+
     async def warm_up(self) -> None:
-        """Pre-load models at startup. Run in executor to not block the event loop."""
-        loop = asyncio.get_event_loop()
-        s = self._settings
-        self._whisper_model = await loop.run_in_executor(
-            None,
-            load_whisper_model,
-            s.whisper_model,
-            s.resolved_device,
-            s.effective_compute_type,
-        )
-        if s.hf_token:
+        """Pre-load Whisper and (if HF_TOKEN present) the diarization pipeline.
+
+        Whisper is required — its failure raises ``TranscriptionError`` and
+        prevents startup. Diarization failure is logged and ignored so the
+        server can still serve transcription-only jobs.
+        """
+        loop = asyncio.get_running_loop()
+        cfg = self._settings
+
+        try:
+            self._whisper_model = await loop.run_in_executor(
+                None,
+                load_whisper_model,
+                cfg.whisper_model,
+                cfg.resolved_device,
+                cfg.effective_compute_type,
+            )
+        except TranscriptionError:
+            logger.exception("Whisper model failed to load — server cannot start.")
+            raise
+
+        if cfg.hf_token:
             try:
                 self._diarization_pipeline = await loop.run_in_executor(
                     None,
                     load_diarization_pipeline,
-                    s.hf_token,
-                    s.resolved_device,
+                    cfg.hf_token,
+                    cfg.resolved_device,
                 )
             except DiarizationError as e:
                 logger.warning(
-                    "Diarization pipeline failed to load — speaker identification will be skipped. "
-                    "Reason: %s", e
+                    "Diarization pipeline failed to load — speaker identification "
+                    "will be skipped. Reason: %s",
+                    e,
                 )
+        else:
+            logger.info("HF_TOKEN not set — diarization disabled.")
 
     async def run(
         self,
         job: Job,
         input_path: Path,
-        language: str = "es",
+        language: str | None = "es",
         num_speakers: int | None = None,
         summarize: bool = True,
         use_claude: bool = False,
     ) -> None:
         """Execute the full pipeline for a job.
 
-        This method catches all exceptions and marks the job as failed
-        rather than letting them propagate.
-
-        Args:
-            job: The Job object to update with progress.
-            input_path: Path to the uploaded MP4 file.
-            language: ISO 639-1 language code for transcription.
-            num_speakers: Optional speaker count hint.
-            summarize: Whether to generate a summary.
-            use_claude: Use Claude API instead of Ollama for summarization.
+        Catches all exceptions and marks the job as failed (or completed with
+        partial results) rather than letting them propagate to the caller.
         """
-        loop = asyncio.get_event_loop()
-        s = self._settings
+        loop = asyncio.get_running_loop()
+        cfg = self._settings
         wav_path = input_path.with_suffix(".wav")
+        raw_segments: list[RawSegment] = []
+        diar_segments: list = []
+        summary_text = ""
 
         try:
-            # --- Step 1: Extract audio ---
+            # ── Step 1: Extract audio ─────────────────────────────────────
             await self._registry.update_progress(
                 job, 5.0, PipelineStep.EXTRACTING_AUDIO, "Converting MP4 to WAV"
             )
+            t0 = time.monotonic()
             await loop.run_in_executor(
-                None, extract_audio, input_path, wav_path, s.ffmpeg_path
+                None, extract_audio, input_path, wav_path, cfg.ffmpeg_path
             )
+            logger.info("Audio extracted in %.1fs", time.monotonic() - t0)
 
-            # --- Step 2: Transcribe ---
+            # ── Step 2: Transcribe ────────────────────────────────────────
             await self._registry.update_progress(
                 job, 10.0, PipelineStep.TRANSCRIBING, "Starting transcription"
             )
-            raw_segments: list[RawSegment] = []
-
+            t0 = time.monotonic()
             segments_gen = await loop.run_in_executor(
-                None, lambda: list(transcribe(self._whisper_model, wav_path, language))
+                None,
+                lambda: list(transcribe(self._whisper_model, wav_path, language)),
             )
             total = len(segments_gen)
-            logger.info("Transcription produced %d segment(s)", total)
+            logger.info(
+                "Transcription produced %d segment(s) in %.1fs",
+                total,
+                time.monotonic() - t0,
+            )
+
             for i, seg in enumerate(segments_gen):
                 raw_segments.append(seg)
                 pct = 10.0 + (50.0 * (i + 1) / max(total, 1))
                 await self._registry.update_progress(
-                    job, pct, PipelineStep.TRANSCRIBING,
-                    f"Segment {i + 1}/{total}",
+                    job, pct, PipelineStep.TRANSCRIBING, f"Segment {i + 1}/{total}"
                 )
 
-            # --- Step 3: Diarize ---
-            diar_segments = []
-            if self._diarization_pipeline is not None:
+            if total == 0:
+                # Push the bar forward even when nothing was found.
+                await self._registry.update_progress(
+                    job, 60.0, PipelineStep.TRANSCRIBING,
+                    "No speech detected by VAD",
+                )
+
+            # ── Step 3: Diarize ───────────────────────────────────────────
+            if self.diarization_ready and raw_segments:
                 await self._registry.update_progress(
                     job, 62.0, PipelineStep.DIARIZING, "Identifying speakers"
                 )
+                t0 = time.monotonic()
                 try:
                     diar_segments = await loop.run_in_executor(
-                        None, diarize, self._diarization_pipeline, wav_path, num_speakers
+                        None,
+                        diarize,
+                        self._diarization_pipeline,
+                        wav_path,
+                        num_speakers,
+                    )
+                    logger.info(
+                        "Diarization produced %d turn(s) in %.1fs",
+                        len(diar_segments),
+                        time.monotonic() - t0,
                     )
                 except DiarizationError as e:
-                    logger.warning("Diarization failed at inference time, continuing without speaker labels: %s", e)
+                    logger.warning(
+                        "Diarization failed at inference — continuing without "
+                        "speaker labels. Reason: %s",
+                        e,
+                    )
             else:
+                detail = (
+                    "Skipped (no segments to label)"
+                    if not raw_segments
+                    else "Skipped (no HuggingFace token / model unavailable)"
+                )
                 await self._registry.update_progress(
-                    job, 62.0, PipelineStep.DIARIZING,
-                    "Skipped (no HuggingFace token)",
+                    job, 62.0, PipelineStep.DIARIZING, detail
                 )
 
-            # --- Step 4: Merge ---
+            # ── Step 4: Merge ─────────────────────────────────────────────
             await self._registry.update_progress(
                 job, 75.0, PipelineStep.MERGING, "Aligning speakers to transcript"
             )
@@ -160,49 +217,82 @@ class PipelineRunner:
             else:
                 diarized = [
                     DiarizedSegment(
-                        speaker="SPEAKER_00", start=seg.start, end=seg.end, text=seg.text
+                        speaker="SPEAKER_00",
+                        start=seg.start,
+                        end=seg.end,
+                        text=seg.text,
                     )
                     for seg in raw_segments
                 ]
 
-            # --- Step 5: Summarize ---
-            summary = ""
-            if summarize:
+            # ── Step 5: Summarize (optional, non-fatal) ───────────────────
+            if summarize and diarized:
                 await self._registry.update_progress(
                     job, 80.0, PipelineStep.SUMMARIZING, "Generating summary"
                 )
+                t0 = time.monotonic()
                 try:
-                    if use_claude and s.anthropic_api_key:
-                        summary = await summarize_with_claude(diarized, s.anthropic_api_key)
-                    else:
-                        summary = await summarize_with_ollama(
-                            diarized, s.ollama_base_url, s.ollama_model
+                    if use_claude and cfg.anthropic_api_key:
+                        summary_text = await summarize_with_claude(
+                            diarized, cfg.anthropic_api_key
                         )
+                    else:
+                        summary_text = await summarize_with_ollama(
+                            diarized, cfg.ollama_base_url, cfg.ollama_model
+                        )
+                    logger.info("Summary generated in %.1fs", time.monotonic() - t0)
                 except SummarizationError as e:
-                    summary = f"[Summarization failed: {e}]"
+                    logger.warning("Summarization failed: %s", e)
+                    summary_text = f"[Summarization failed: {e}]"
 
-            # --- Done ---
+            # ── Done ──────────────────────────────────────────────────────
             speakers = sorted(set(seg.speaker for seg in diarized))
             result = {
                 "duration_seconds": diarized[-1].end if diarized else 0.0,
-                "language": language,
+                "language": language or "auto",
                 "speakers": speakers,
                 "segments": [
-                    {"speaker": seg.speaker, "start": seg.start, "end": seg.end, "text": seg.text}
+                    {
+                        "speaker": seg.speaker,
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg.text,
+                    }
                     for seg in diarized
                 ],
-                "summary": summary,
+                "summary": summary_text,
             }
 
             await self._registry.mark_completed(job, result)
-            await loop.run_in_executor(None, _save_outputs, job.job_id, diarized, summary, s.base_dir)
+
+            # Output saving is non-fatal: if disk is full we still succeed.
+            try:
+                tx, sm = await loop.run_in_executor(
+                    None,
+                    _save_outputs,
+                    job.job_id,
+                    diarized,
+                    summary_text,
+                    cfg.base_dir,
+                )
+                logger.info(
+                    "Saved %s%s",
+                    tx.name,
+                    f" + {sm.name}" if sm else "",
+                )
+            except Exception:
+                logger.exception("Failed to save output files (job result kept in memory)")
 
         except (AudioExtractionError, TranscriptionError) as e:
+            logger.error("Pipeline failed: %s", e)
             await self._registry.mark_failed(job, str(e))
         except Exception as e:
+            logger.exception("Unexpected pipeline error")
             await self._registry.mark_failed(job, f"Unexpected error: {e}")
         finally:
-            if wav_path.exists():
-                wav_path.unlink(missing_ok=True)
-            if input_path.exists():
-                input_path.unlink(missing_ok=True)
+            for path in (wav_path, input_path):
+                try:
+                    if path.exists():
+                        path.unlink(missing_ok=True)
+                except Exception:
+                    logger.warning("Could not delete %s", path)

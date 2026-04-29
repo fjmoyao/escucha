@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
-import torch
 from dotenv import load_dotenv
 
 
@@ -44,6 +43,7 @@ class Settings:
     def resolved_device(self) -> str:
         """Return 'cuda' or 'cpu'. Resolves 'auto'."""
         if self.device == "auto":
+            import torch
             return "cuda" if torch.cuda.is_available() else "cpu"
         return self.device
 
