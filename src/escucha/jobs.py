@@ -34,6 +34,9 @@ class Job:
     listeners: list[WebSocket] = field(default_factory=list, repr=False)
 
 
+_MAX_STORED_JOBS = 20
+
+
 class JobRegistry:
     """In-memory registry of jobs. Single-job concurrency enforced.
 
@@ -51,15 +54,30 @@ class JobRegistry:
             active = self._jobs[self._active_job_id]
             if active.status == JobStatus.PROCESSING:
                 raise RuntimeError("A job is already running")
+        self._evict_old_jobs()
         job_id = uuid.uuid4().hex[:8]
         job = Job(job_id=job_id)
         self._jobs[job_id] = job
         self._active_job_id = job_id
         return job
 
+    def _evict_old_jobs(self) -> None:
+        """Remove oldest finished jobs when the store exceeds the limit."""
+        finished = [
+            jid for jid, j in self._jobs.items()
+            if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+        ]
+        excess = len(self._jobs) - _MAX_STORED_JOBS
+        for jid in finished[:excess]:
+            del self._jobs[jid]
+
     def get(self, job_id: str) -> Job | None:
         """Return a job by ID, or None."""
         return self._jobs.get(job_id)
+
+    def all_jobs(self) -> list[Job]:
+        """Return all jobs currently tracked, newest first."""
+        return list(self._jobs.values())[::-1]
 
     async def update_progress(
         self,

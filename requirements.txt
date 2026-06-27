@@ -32,3 +32,5 @@ anthropic==0.52.0
 # -- Utilities ------------------------------------------------
 python-dotenv==1.1.0
 pydantic==2.13.3
+soundfile>=0.12.1                 # WAV loader; bundles libsndfile DLL —
+                                  # used by diarizer to bypass torchcodec/FFmpeg-DLL deps

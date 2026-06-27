@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -5,13 +6,16 @@ from unittest.mock import patch, MagicMock
 import pytest
 from escucha.audio import extract_audio, AudioExtractionError
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_FFMPEG = str(_REPO_ROOT / "bin" / "ffmpeg.exe") if (_REPO_ROOT / "bin" / "ffmpeg.exe").exists() else shutil.which("ffmpeg") or "ffmpeg"
+
 
 @pytest.fixture
 def tiny_mp4(tmp_path: Path) -> Path:
     """Generate a 1-second MP4 with a sine tone audio track using FFmpeg."""
     out = tmp_path / "test.mp4"
     subprocess.run(
-        ["ffmpeg", "-y",
+        [_FFMPEG, "-y",
          "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
          "-f", "lavfi", "-i", "color=c=black:size=64x64:rate=1:duration=1",
          "-shortest", str(out)],
@@ -22,7 +26,7 @@ def tiny_mp4(tmp_path: Path) -> Path:
 
 def test_extract_audio_produces_wav(tiny_mp4, tmp_path):
     out = tmp_path / "out.wav"
-    result = extract_audio(tiny_mp4, out)
+    result = extract_audio(tiny_mp4, out, ffmpeg_path=Path(_FFMPEG))
     assert result == out
     assert out.exists()
     assert out.stat().st_size > 0
@@ -37,7 +41,7 @@ def test_extract_audio_invalid_file(tmp_path):
     bad = tmp_path / "fake.mp4"
     bad.write_text("this is not a video file")
     with pytest.raises(AudioExtractionError):
-        extract_audio(bad, tmp_path / "out.wav")
+        extract_audio(bad, tmp_path / "out.wav", ffmpeg_path=Path(_FFMPEG))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
@@ -52,3 +56,23 @@ def test_extract_audio_creates_no_window(tmp_path):
             pass
         call_kwargs = mock_run.call_args.kwargs
         assert call_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
+
+
+def test_extract_audio_creates_output_directory(tiny_mp4, tmp_path):
+    """If the output directory doesn't exist yet, extract_audio creates it."""
+    out = tmp_path / "nested" / "dirs" / "out.wav"
+    assert not out.parent.exists()
+    extract_audio(tiny_mp4, out, ffmpeg_path=Path(_FFMPEG))
+    assert out.exists()
+
+
+def test_extract_audio_missing_ffmpeg_binary(tmp_path):
+    """A clearly broken ffmpeg path raises AudioExtractionError, not FileNotFoundError."""
+    bad_input = tmp_path / "src.mp4"
+    bad_input.write_bytes(b"\x00\x00")
+    with pytest.raises(AudioExtractionError, match="FFmpeg"):
+        extract_audio(
+            bad_input,
+            tmp_path / "out.wav",
+            ffmpeg_path=Path("nonexistent_ffmpeg_xyz_12345"),
+        )
